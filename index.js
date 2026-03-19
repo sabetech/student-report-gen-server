@@ -3,13 +3,278 @@ const cors = require('cors');
 const pool = require('./db');
 const bcrypt = require('bcryptjs');
 const path = require('path');
+const multer = require('multer');
+const ftp = require('basic-ftp');
+const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 const PORT = process.env.PORT;
 
+const upload = multer({ storage: multer.memoryStorage() });
+
 app.use(cors());
 app.use(express.json());
+
+// --- School Info & Logo Upload ---
+
+// Get school info
+app.get('/api/school-info', async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM school_info WHERE id = 1');
+        if (rows.length === 0) {
+            return res.status(404).json({ status: 'Error', message: 'School info not found' });
+        }
+        res.json({ status: 'OK', schoolInfo: rows[0] });
+    } catch (error) {
+        console.error('Error fetching school info:', error);
+        res.status(500).json({ status: 'Error', message: 'Failed to fetch school info' });
+    }
+});
+
+// Update school info
+app.post('/api/school-info', async (req, res) => {
+    const { name, contact_numbers, post_address, email, website, logo_url } = req.body;
+    try {
+        await pool.query(`
+            UPDATE school_info 
+            SET name = ?, contact_numbers = ?, post_address = ?, email = ?, website = ?, logo_url = ?
+            WHERE id = 1
+        `, [name, contact_numbers, post_address, email, website, logo_url]);
+        res.json({ status: 'OK', message: 'School information updated successfully' });
+    } catch (error) {
+        console.error('Error updating school info:', error);
+        res.status(500).json({ status: 'Error', message: 'Failed to update school info' });
+    }
+});
+
+// Upload logo to FTP
+app.post('/api/upload-logo', upload.single('logo'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ status: 'Error', message: 'No file uploaded' });
+    }
+
+    const client = new ftp.Client();
+    client.ftp.verbose = true;
+
+    const fileName = `logo_${Date.now()}${path.extname(req.file.originalname)}`;
+
+    try {
+        await client.access({
+            host: process.env.FTP_HOST,
+            user: process.env.FTP_USER,
+            password: process.env.FTP_PASS,
+            secure: false
+        });
+
+        console.log("FTP connected. Current directory:", await client.pwd());
+
+        // Use a relative path starting from the FTP root.
+        // Based on user request, it should go to uploads/resultgen
+        const uploadDir = 'uploads/resultgen';
+        await client.ensureDir(uploadDir);
+
+        console.log("Directory ensured. Current directory:", await client.pwd());
+
+        // Upload from buffer
+        const bufferStream = new require('stream').PassThrough();
+        bufferStream.end(req.file.buffer);
+
+        await client.uploadFrom(bufferStream, fileName);
+
+        const publicUrl = `${process.env.FTP_BASE_URL}/uploads/resultgen/${fileName}`;
+
+        res.json({
+            status: 'OK',
+            message: 'Logo uploaded successfully',
+            url: publicUrl
+        });
+    } catch (err) {
+        console.error('FTP Upload Error:', err);
+        res.status(500).json({
+            status: 'Error',
+            message: 'Failed to upload logo to server',
+            error: err.message
+        });
+    } finally {
+        client.close();
+    }
+});
+
+// --- Result Generation Validation ---
+
+// Validate if all students have all subject scores for a config
+app.get('/api/exam-config-validation/:configId', async (req, res) => {
+    const { configId } = req.params;
+    try {
+        // 1. Get the configuration (class_id)
+        const [configs] = await pool.query('SELECT class_id FROM exam_configurations WHERE id = ?', [configId]);
+        if (configs.length === 0) {
+            return res.status(404).json({ status: 'Error', message: 'Configuration not found' });
+        }
+        const classId = configs[0].class_id;
+
+        // 2. Get all students in that class
+        const [students] = await pool.query(`
+            SELECT s.id, CONCAT(s.firstname, ' ', IFNULL(s.middlename, ''), ' ', IFNULL(s.lastname, '')) as fullname, s.admission_no
+            FROM students s
+            JOIN student_session ss ON s.id = ss.student_id
+            WHERE ss.class_id = ? AND s.is_active = 'yes'
+            ORDER BY s.firstname ASC
+        `, [classId]);
+
+        // 3. Get all subjects assigned to this config
+        const [subjects] = await pool.query(`
+            SELECT s.id, s.name 
+            FROM subjects s
+            JOIN exam_config_subjects ecs ON s.id = ecs.subject_id
+            WHERE ecs.config_id = ?
+            ORDER BY s.name ASC
+        `, [configId]);
+
+        // 4. Get all scores for this config
+        const [scores] = await pool.query('SELECT student_id, subject_id FROM student_subject_scores WHERE config_id = ?', [configId]);
+        
+        // 5. Cross-reference to find missing data
+        const validationResults = [];
+        
+        for (const student of students) {
+            const missingSubjects = [];
+            for (const subject of subjects) {
+                const hasScore = scores.some(s => s.student_id === student.id && s.subject_id === subject.id);
+                if (!hasScore) {
+                    missingSubjects.push(subject.name);
+                }
+            }
+            if (missingSubjects.length > 0) {
+                validationResults.push({
+                    studentId: student.id,
+                    studentName: student.fullname,
+                    admissionNo: student.admission_no,
+                    missingSubjects: missingSubjects
+                });
+            }
+        }
+
+        res.json({ 
+            status: 'OK', 
+            totalStudents: students.length,
+            missingCount: validationResults.length,
+            validation: validationResults 
+        });
+
+    } catch (error) {
+        console.error('Validation error:', error);
+        res.status(500).json({ status: 'Error', message: 'Failed to perform validation', error: error.message });
+    }
+});
+
+// --- Report Data Consolidation ---
+
+// Get all data needed for report generation for a specific config
+app.get('/api/report-data/:configId', async (req, res) => {
+    const { configId } = req.params;
+    try {
+        // 1. Get school info
+        const [schoolInfo] = await pool.query('SELECT * FROM school_info LIMIT 1');
+
+        // 2. Get full configuration
+        const [configs] = await pool.query('SELECT * FROM exam_configurations WHERE id = ?', [configId]);
+        if (configs.length === 0) return res.status(404).json({ status: 'Error', message: 'Config not found' });
+        const config = configs[0];
+
+        // 3. Get assigned subjects
+        const [subjects] = await pool.query(`
+            SELECT s.id, s.name 
+            FROM subjects s
+            JOIN exam_config_subjects ecs ON s.id = ecs.subject_id
+            WHERE ecs.config_id = ?
+            ORDER BY s.name ASC
+        `, [configId]);
+
+        // 4. Get students in the class
+        const [students] = await pool.query(`
+            SELECT s.id, s.firstname, s.middlename, s.lastname, s.admission_no
+            FROM students s
+            JOIN student_session ss ON s.id = ss.student_id
+            WHERE ss.class_id = ? AND s.is_active = 'yes'
+            ORDER BY s.firstname ASC
+        `, [config.class_id]);
+
+        // 5. Get all scores and weights
+        const [weights] = await pool.query('SELECT * FROM assessment_weights WHERE config_id = ?', [configId]);
+        const [scores] = await pool.query('SELECT * FROM student_subject_scores WHERE config_id = ?', [configId]);
+
+        // 6. Process data per student
+        if (students.length > 0) console.log('DEBUG Raw First Row Keys:', Object.keys(students[0]));
+        
+        const studentReports = students.map(student => {
+            const studentScores = subjects.map(subject => {
+                const subjectScores = scores.filter(s => s.student_id === student.id && s.subject_id === subject.id);
+                
+                // Calculate weighted total for this subject
+                let totalScore = 0;
+                const weightBreakdown = weights.map(w => {
+                    const scoreEntry = subjectScores.find(s => s.weight_id === w.id);
+                    const rawScore = scoreEntry ? scoreEntry.score : 0;
+                    const weightedValue = (rawScore / (w.max_score || 100)) * w.weight_percent;
+                    totalScore += weightedValue;
+                    return { 
+                        weightName: w.name, 
+                        weightPercent: w.weight_percent,
+                        rawScore: rawScore,
+                        weightedValue: weightedValue.toFixed(2)
+                    };
+                });
+
+                return {
+                    id: subject.id,
+                    name: subject.name,
+                    weights: weightBreakdown,
+                    total: parseFloat(totalScore.toFixed(2))
+                };
+            });
+
+            const overallTotal = studentScores.reduce((sum, s) => sum + s.total, 0);
+            const overallAverage = studentScores.length > 0 ? (overallTotal / studentScores.length).toFixed(2) : 0;
+
+            const fullName = [student.firstname, student.middlename, student.lastname]
+                .map(part => part ? part.toString().trim() : '')
+                .filter(part => part !== '')
+                .join(' ');
+            
+            return {
+                id: student.id,
+                name: fullName || 'Unknown Student',
+                admissionNo: student.admission_no || 'N/A',
+                subjects: studentScores,
+                overallTotal: parseFloat(overallTotal.toFixed(2)),
+                overallAverage: parseFloat(overallAverage)
+            };
+        });
+
+        // 7. Calculate Ranks (Position in Class) based on overallTotal
+        const sortedByTotal = [...studentReports].sort((a, b) => b.overallTotal - a.overallTotal);
+        studentReports.forEach(report => {
+            report.position = sortedByTotal.findIndex(s => s.id === report.id) + 1;
+        });
+
+        res.json({
+            status: 'OK',
+            school: schoolInfo[0] || {},
+            config: config,
+            students: studentReports,
+            totalStudents: students.length,
+            subjectsCount: subjects.length
+        });
+
+    } catch (error) {
+        console.error('Report data error:', error);
+        res.status(500).json({ status: 'Error', message: 'Failed to fetch report data', error: error.message });
+    }
+});
+
+// --- Existing Endpoints ---
 
 // Test endpoint
 app.get('/api/health', async (req, res) => {
@@ -185,7 +450,7 @@ app.get('/api/subjects', async (req, res) => {
         }
 
         query += ' ORDER BY name ASC';
-        
+
         const [rows] = await pool.query(query, params);
         res.json({ status: 'OK', subjects: rows });
     } catch (error) {
@@ -292,7 +557,7 @@ app.get('/api/student-subject-scores/:configId/:subjectId', async (req, res) => 
 // Batch save/update student scores
 app.post('/api/student-subject-scores', async (req, res) => {
     const { scores } = req.body; // Array of { student_id, config_id, subject_id, weight_id, score }
-    
+
     if (!Array.isArray(scores) || scores.length === 0) {
         return res.status(400).json({ status: 'Error', message: 'Scores array is required' });
     }
@@ -308,9 +573,9 @@ app.post('/api/student-subject-scores', async (req, res) => {
         `;
 
         const values = scores.map(s => [s.student_id, s.config_id, s.subject_id, s.weight_id, s.score]);
-        
+
         await connection.query(query, [values]);
-        
+
         await connection.commit();
         res.json({ status: 'OK', message: 'Scores saved successfully' });
     } catch (error) {
