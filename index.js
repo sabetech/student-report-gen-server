@@ -55,7 +55,7 @@ app.post('/api/login', async (req, res) => {
 
 // Save Exam Configuration
 app.post('/api/exam-configurations', async (req, res) => {
-    const { class_id, weights, remarks, gradingScale } = req.body;
+    const { class_id, weights, remarks, gradingScale, id: configId } = req.body;
 
     if (!class_id || !weights || !remarks || !gradingScale) {
         return res.status(400).json({ status: 'Error', message: 'Missing required configuration data' });
@@ -65,39 +65,51 @@ app.post('/api/exam-configurations', async (req, res) => {
     try {
         await connection.beginTransaction();
 
-        // 1. Insert or update the master configuration
-        const [configResult] = await connection.query(
-            'INSERT INTO exam_configurations (class_id) VALUES (?) ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP',
-            [class_id]
-        );
-        
-        let configId;
-        if (configResult.insertId) {
-            configId = configResult.insertId;
+        let finalConfigId = configId;
+        let version = 1;
+
+        if (!finalConfigId) {
+            // Check for existing configs for this class to determine version
+            const [existingConfigs] = await connection.query(
+                'SELECT MAX(version) as maxVersion FROM exam_configurations WHERE class_id = ?',
+                [class_id]
+            );
+            if (existingConfigs[0].maxVersion) {
+                version = existingConfigs[0].maxVersion + 1;
+            }
+
+            const [configResult] = await connection.query(
+                'INSERT INTO exam_configurations (class_id, version) VALUES (?, ?)',
+                [class_id, version]
+            );
+            finalConfigId = configResult.insertId;
         } else {
-            const [rows] = await connection.query('SELECT id FROM exam_configurations WHERE class_id = ?', [class_id]);
-            configId = rows[0].id;
+            // Updating an existing specific version
+            await connection.query(
+                'UPDATE exam_configurations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                [finalConfigId]
+            );
         }
 
         // 2. Clear old sub-data
-        await connection.query('DELETE FROM assessment_weights WHERE config_id = ?', [configId]);
-        await connection.query('DELETE FROM grade_remarks WHERE config_id = ?', [configId]);
-        await connection.query('DELETE FROM grading_scales WHERE config_id = ?', [configId]);
+        await connection.query('DELETE FROM assessment_weights WHERE config_id = ?', [finalConfigId]);
+        await connection.query('DELETE FROM grade_remarks WHERE config_id = ?', [finalConfigId]);
+        await connection.query('DELETE FROM grading_scales WHERE config_id = ?', [finalConfigId]);
 
         // 3. Insert new weights
-        const weightValues = weights.map(w => [configId, w.name, w.value]);
+        const weightValues = weights.map(w => [finalConfigId, w.name, w.value]);
         await connection.query('INSERT INTO assessment_weights (config_id, name, weight_percent) VALUES ?', [weightValues]);
 
         // 4. Insert new remarks
-        const remarkValues = remarks.map(r => [configId, r.grade, r.text]);
+        const remarkValues = remarks.map(r => [finalConfigId, r.grade, r.text]);
         await connection.query('INSERT INTO grade_remarks (config_id, grade, remark_text) VALUES ?', [remarkValues]);
 
         // 5. Insert new grading scales
-        const scaleValues = gradingScale.map(s => [configId, s.label, s.min, s.max]);
+        const scaleValues = gradingScale.map(s => [finalConfigId, s.label, s.min, s.max]);
         await connection.query('INSERT INTO grading_scales (config_id, grade, min_score, max_score) VALUES ?', [scaleValues]);
 
         await connection.commit();
-        res.json({ status: 'OK', message: 'Configuration saved successfully', configId });
+        res.json({ status: 'OK', message: 'Configuration saved successfully', configId: finalConfigId, version });
     } catch (error) {
         await connection.rollback();
         console.error('Error saving configuration:', error);
