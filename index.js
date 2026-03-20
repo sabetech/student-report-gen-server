@@ -21,7 +21,7 @@ app.use(express.json());
 // Get school info
 app.get('/api/school-info', async (req, res) => {
     try {
-        const [rows] = await pool.query('SELECT * FROM school_info WHERE id = 1');
+        const [rows] = await pool.query('SELECT * FROM srg_school_info WHERE id = 1');
         if (rows.length === 0) {
             return res.status(404).json({ status: 'Error', message: 'School info not found' });
         }
@@ -37,7 +37,7 @@ app.post('/api/school-info', async (req, res) => {
     const { name, contact_numbers, post_address, email, website, logo_url } = req.body;
     try {
         await pool.query(`
-            UPDATE school_info 
+            UPDATE srg_school_info 
             SET name = ?, contact_numbers = ?, post_address = ?, email = ?, website = ?, logo_url = ?
             WHERE id = 1
         `, [name, contact_numbers, post_address, email, website, logo_url]);
@@ -108,7 +108,7 @@ app.get('/api/exam-config-validation/:configId', async (req, res) => {
     const { configId } = req.params;
     try {
         // 1. Get the configuration (class_id)
-        const [configs] = await pool.query('SELECT class_id FROM exam_configurations WHERE id = ?', [configId]);
+        const [configs] = await pool.query('SELECT class_id FROM srg_exam_configurations WHERE id = ?', [configId]);
         if (configs.length === 0) {
             return res.status(404).json({ status: 'Error', message: 'Configuration not found' });
         }
@@ -127,13 +127,13 @@ app.get('/api/exam-config-validation/:configId', async (req, res) => {
         const [subjects] = await pool.query(`
             SELECT s.id, s.name 
             FROM subjects s
-            JOIN exam_config_subjects ecs ON s.id = ecs.subject_id
+            JOIN srg_exam_config_subjects ecs ON s.id = ecs.subject_id
             WHERE ecs.config_id = ?
             ORDER BY s.name ASC
         `, [configId]);
 
         // 4. Get all scores for this config
-        const [scores] = await pool.query('SELECT student_id, subject_id FROM student_subject_scores WHERE config_id = ?', [configId]);
+        const [scores] = await pool.query('SELECT student_id, subject_id FROM srg_student_subject_scores WHERE config_id = ?', [configId]);
         
         // 5. Cross-reference to find missing data
         const validationResults = [];
@@ -176,10 +176,10 @@ app.get('/api/report-data/:configId', async (req, res) => {
     const { configId } = req.params;
     try {
         // 1. Get school info
-        const [schoolInfo] = await pool.query('SELECT * FROM school_info LIMIT 1');
+        const [schoolInfo] = await pool.query('SELECT * FROM srg_school_info LIMIT 1');
 
         // 2. Get full configuration
-        const [configs] = await pool.query('SELECT * FROM exam_configurations WHERE id = ?', [configId]);
+        const [configs] = await pool.query('SELECT * FROM srg_exam_configurations WHERE id = ?', [configId]);
         if (configs.length === 0) return res.status(404).json({ status: 'Error', message: 'Config not found' });
         const config = configs[0];
 
@@ -187,7 +187,7 @@ app.get('/api/report-data/:configId', async (req, res) => {
         const [subjects] = await pool.query(`
             SELECT s.id, s.name 
             FROM subjects s
-            JOIN exam_config_subjects ecs ON s.id = ecs.subject_id
+            JOIN srg_exam_config_subjects ecs ON s.id = ecs.subject_id
             WHERE ecs.config_id = ?
             ORDER BY s.name ASC
         `, [configId]);
@@ -202,8 +202,8 @@ app.get('/api/report-data/:configId', async (req, res) => {
         `, [config.class_id]);
 
         // 5. Get all scores and weights
-        const [weights] = await pool.query('SELECT * FROM assessment_weights WHERE config_id = ?', [configId]);
-        const [scores] = await pool.query('SELECT * FROM student_subject_scores WHERE config_id = ?', [configId]);
+        const [weights] = await pool.query('SELECT * FROM srg_assessment_weights WHERE config_id = ?', [configId]);
+        const [scores] = await pool.query('SELECT * FROM srg_student_subject_scores WHERE config_id = ?', [configId]);
 
         // 6. Process data per student
         if (students.length > 0) console.log('DEBUG Raw First Row Keys:', Object.keys(students[0]));
@@ -336,7 +336,7 @@ app.post('/api/exam-configurations', async (req, res) => {
         if (!finalConfigId) {
             // Check for existing configs for this class to determine version
             const [existingConfigs] = await connection.query(
-                'SELECT MAX(version) as maxVersion FROM exam_configurations WHERE class_id = ?',
+                'SELECT MAX(version) as maxVersion FROM srg_exam_configurations WHERE class_id = ?',
                 [class_id]
             );
             if (existingConfigs[0].maxVersion) {
@@ -344,34 +344,34 @@ app.post('/api/exam-configurations', async (req, res) => {
             }
 
             const [configResult] = await connection.query(
-                'INSERT INTO exam_configurations (class_id, version) VALUES (?, ?)',
+                'INSERT INTO srg_exam_configurations (class_id, version) VALUES (?, ?)',
                 [class_id, version]
             );
             finalConfigId = configResult.insertId;
         } else {
             // Updating an existing specific version
             await connection.query(
-                'UPDATE exam_configurations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                'UPDATE srg_exam_configurations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                 [finalConfigId]
             );
         }
 
         // 2. Clear old sub-data
-        await connection.query('DELETE FROM assessment_weights WHERE config_id = ?', [finalConfigId]);
-        await connection.query('DELETE FROM grade_remarks WHERE config_id = ?', [finalConfigId]);
-        await connection.query('DELETE FROM grading_scales WHERE config_id = ?', [finalConfigId]);
+        await connection.query('DELETE FROM srg_assessment_weights WHERE config_id = ?', [finalConfigId]);
+        await connection.query('DELETE FROM srg_grade_remarks WHERE config_id = ?', [finalConfigId]);
+        await connection.query('DELETE FROM srg_grading_scales WHERE config_id = ?', [finalConfigId]);
 
         // 3. Insert new weights
         const weightValues = weights.map(w => [finalConfigId, w.name, w.value]);
-        await connection.query('INSERT INTO assessment_weights (config_id, name, weight_percent) VALUES ?', [weightValues]);
+        await connection.query('INSERT INTO srg_assessment_weights (config_id, name, weight_percent) VALUES ?', [weightValues]);
 
         // 4. Insert new remarks
         const remarkValues = remarks.map(r => [finalConfigId, r.grade, r.text]);
-        await connection.query('INSERT INTO grade_remarks (config_id, grade, remark_text) VALUES ?', [remarkValues]);
+        await connection.query('INSERT INTO srg_grade_remarks (config_id, grade, remark_text) VALUES ?', [remarkValues]);
 
         // 5. Insert new grading scales
         const scaleValues = gradingScale.map(s => [finalConfigId, s.label, s.min, s.max]);
-        await connection.query('INSERT INTO grading_scales (config_id, grade, min_score, max_score) VALUES ?', [scaleValues]);
+        await connection.query('INSERT INTO srg_grading_scales (config_id, grade, min_score, max_score) VALUES ?', [scaleValues]);
 
         await connection.commit();
         res.json({ status: 'OK', message: 'Configuration saved successfully', configId: finalConfigId, version });
@@ -389,7 +389,7 @@ app.get('/api/exam-configurations', async (req, res) => {
     try {
         const [rows] = await pool.query(`
             SELECT ec.*, c.class as class_name 
-            FROM exam_configurations ec
+            FROM srg_exam_configurations ec
             JOIN classes c ON ec.class_id = c.id
             ORDER BY c.class ASC
         `);
@@ -406,7 +406,7 @@ app.get('/api/exam-configurations/:id', async (req, res) => {
     try {
         const [configs] = await pool.query(`
             SELECT ec.*, c.class as class_name 
-            FROM exam_configurations ec
+            FROM srg_exam_configurations ec
             JOIN classes c ON ec.class_id = c.id
             WHERE ec.id = ?
         `, [id]);
@@ -418,9 +418,9 @@ app.get('/api/exam-configurations/:id', async (req, res) => {
         const config = configs[0];
 
         // Fetch associated details
-        const [weights] = await pool.query('SELECT id, config_id, name, weight_percent as value FROM assessment_weights WHERE config_id = ?', [id]);
-        const [remarks] = await pool.query('SELECT config_id, grade, remark_text as text FROM grade_remarks WHERE config_id = ?', [id]);
-        const [scales] = await pool.query('SELECT config_id, grade as label, min_score as min, max_score as max FROM grading_scales WHERE config_id = ?', [id]);
+        const [weights] = await pool.query('SELECT id, config_id, name, weight_percent as value FROM srg_assessment_weights WHERE config_id = ?', [id]);
+        const [remarks] = await pool.query('SELECT config_id, grade, remark_text as text FROM srg_grade_remarks WHERE config_id = ?', [id]);
+        const [scales] = await pool.query('SELECT config_id, grade as label, min_score as min, max_score as max FROM srg_grading_scales WHERE config_id = ?', [id]);
 
         res.json({
             status: 'OK',
@@ -466,7 +466,7 @@ app.get('/api/exam-config-subjects/:configId', async (req, res) => {
         const [rows] = await pool.query(`
             SELECT s.* 
             FROM subjects s
-            JOIN exam_config_subjects ecs ON s.id = ecs.subject_id
+            JOIN srg_exam_config_subjects ecs ON s.id = ecs.subject_id
             WHERE ecs.config_id = ?
             ORDER BY s.name ASC
         `, [configId]);
@@ -484,7 +484,7 @@ app.post('/api/exam-config-subjects', async (req, res) => {
         return res.status(400).json({ status: 'Error', message: 'configId and subjectId are required' });
     }
     try {
-        await pool.query('INSERT IGNORE INTO exam_config_subjects (config_id, subject_id) VALUES (?, ?)', [configId, subjectId]);
+        await pool.query('INSERT IGNORE INTO srg_exam_config_subjects (config_id, subject_id) VALUES (?, ?)', [configId, subjectId]);
         res.json({ status: 'OK', message: 'Subject assigned successfully' });
     } catch (error) {
         console.error('Error assigning subject:', error);
@@ -496,7 +496,7 @@ app.post('/api/exam-config-subjects', async (req, res) => {
 app.delete('/api/exam-config-subjects/:configId/:subjectId', async (req, res) => {
     const { configId, subjectId } = req.params;
     try {
-        await pool.query('DELETE FROM exam_config_subjects WHERE config_id = ? AND subject_id = ?', [configId, subjectId]);
+        await pool.query('DELETE FROM srg_exam_config_subjects WHERE config_id = ? AND subject_id = ?', [configId, subjectId]);
         res.json({ status: 'OK', message: 'Subject unassigned successfully' });
     } catch (error) {
         console.error('Error unassigning subject:', error);
@@ -544,7 +544,7 @@ app.get('/api/student-subject-scores/:configId/:subjectId', async (req, res) => 
     const { configId, subjectId } = req.params;
     try {
         const [rows] = await pool.query(`
-            SELECT * FROM student_subject_scores 
+            SELECT * FROM srg_student_subject_scores 
             WHERE config_id = ? AND subject_id = ?
         `, [configId, subjectId]);
         res.json({ status: 'OK', scores: rows });
@@ -567,7 +567,7 @@ app.post('/api/student-subject-scores', async (req, res) => {
         await connection.beginTransaction();
 
         const query = `
-            INSERT INTO student_subject_scores (student_id, config_id, subject_id, weight_id, score)
+            INSERT INTO srg_student_subject_scores (student_id, config_id, subject_id, weight_id, score)
             VALUES ?
             ON DUPLICATE KEY UPDATE score = VALUES(score), updated_at = CURRENT_TIMESTAMP
         `;
